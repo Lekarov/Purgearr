@@ -6,7 +6,8 @@ from fastapi.staticfiles import StaticFiles
 
 from api.routes import router as dashboard_router
 from api.webhook import router as webhook_router
-from database import init_db, migrate_db
+from core.pipeline import dedupe_deletion_history
+from database import SessionLocal, init_db, migrate_db
 from scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(
@@ -20,6 +21,13 @@ logging.basicConfig(
 async def lifespan(app: FastAPI):
     init_db()
     migrate_db()
+    db = SessionLocal()
+    try:
+        removed = dedupe_deletion_history(db)
+        if removed:
+            logging.getLogger("purgearr.main").info(f"[Historique] {removed} doublon(s) fusionné(s)")
+    finally:
+        db.close()
     start_scheduler()
     yield
     stop_scheduler()

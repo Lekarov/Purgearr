@@ -599,7 +599,7 @@ def api_scan_copies(
         jf_error = str(e)
 
     label  = series_title or item_title
-    result = scan_copies_smart(label, file_path, scan_paths)
+    result = scan_copies_smart(label, file_path, scan_paths, allow_name_fallback=True)
 
     # ── Liens vers les services ────────────────────────────────────────────────
     cfg_s = get_config()
@@ -687,7 +687,7 @@ def api_scan_copies(
         "jellyfin_path": raw_jf_path or "(vide)",
         "resolved_path": file_path or "(vide)",
         "resolved":      resolved,
-        "file_exists":   os.path.isfile(file_path) if file_path else False,
+        "file_exists":   os.path.exists(file_path) if file_path else False,
         "hash_computed": bool(result.get("source_hash")),
         "hash_prefix":   result.get("source_hash", "")[:12] or "(aucun)",
         "scan_paths":    scan_paths,
@@ -706,8 +706,17 @@ def manual_delete(
     item_title: str = Form(...),
     series_title: str = Form(""),
     source_hash: str = Form(""),
+    selected_name_paths: str = Form(""),
     db: Session = Depends(get_db),
 ):
+    # Chemins "nom" (non vérifiés par contenu) cochés à la main dans la modal —
+    # JSON encodé côté front, jamais utilisés pour les suppressions automatiques.
+    try:
+        extra_delete_paths = json.loads(selected_name_paths) if selected_name_paths else []
+        if not isinstance(extra_delete_paths, list):
+            extra_delete_paths = []
+    except Exception:
+        extra_delete_paths = []
     jf = get_jellyfin()
     details: dict = {}
     provider_ids: dict = {}
@@ -732,13 +741,15 @@ def manual_delete(
     }
 
     if item_type == "Movie":
-        result = delete_movie(db, item, triggered_by="manual", source_hash=source_hash)
+        result = delete_movie(db, item, triggered_by="manual", source_hash=source_hash,
+                               extra_delete_paths=extra_delete_paths)
     else:
         if item_type == "Series":
             # Suppression série complète (ex: depuis Mon Catalogue)
             item["series_title"] = item_title
             item["_force_delete_mode"] = "series"
-        result = delete_episode(db, item, triggered_by="manual", source_hash=source_hash)
+        result = delete_episode(db, item, triggered_by="manual", source_hash=source_hash,
+                                 extra_delete_paths=extra_delete_paths)
 
     return JSONResponse({
         "success":            result["success"],

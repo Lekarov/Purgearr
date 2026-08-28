@@ -42,7 +42,11 @@
     "cleanup_title": "Rapport de nettoyage",
     "copies_deleted": "Supprimées",
     "files_erased": "Fichiers effacés",
-    "space_freed": "Espace libéré"
+    "space_freed": "Espace libéré",
+    "to_verify_title": "À vérifier — trouvés par nom, pas par contenu",
+    "select_all": "Tout cocher",
+    "select_none": "Tout décocher",
+    "selected_of": "sélectionné(s) sur"
   },
   "dashboard": {
     "title": "Dashboard",

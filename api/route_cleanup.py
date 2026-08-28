@@ -10,6 +10,13 @@ from core.fileops import format_size, run_cleanup_from_scan, scan_copies_smart
 router = APIRouter(tags=["cleanup"])
 
 
+def _entry_signatures(entry: dict) -> list:
+    """Une entrée série/saison a une empreinte par épisode (source_hashes) — repli
+    sur l'unique source_hash pour les entrées créées avant son introduction."""
+    hashes = entry.get("source_hashes") or ([entry["source_hash"]] if entry.get("source_hash") else [])
+    return [{"inode": None, "size": None, "hash": h} for h in hashes]
+
+
 @router.post("/api/cleanup/rescan")
 def api_cleanup_rescan():
     """Scanne tous les items de l'index pour trouver les copies résiduelles."""
@@ -24,7 +31,7 @@ def api_cleanup_rescan():
             scan_paths = get_scan_paths(entry.get("item_type", "Movie"))
             scan = scan_copies_smart(
                 entry["item_title"], "", scan_paths,
-                known_signatures=[{"inode": None, "size": None, "hash": entry["source_hash"]}],
+                known_signatures=_entry_signatures(entry),
             )
             entry["remains_checked_at"] = now
             entry["remains_found"] = scan["total_copies"]
@@ -58,7 +65,7 @@ def api_cleanup_delete_remains(entry_id: str = Form(...)):
         scan_paths = get_scan_paths(entry.get("item_type", "Movie"))
         scan = scan_copies_smart(
             entry["item_title"], "", scan_paths,
-            known_signatures=[{"inode": None, "size": None, "hash": entry["source_hash"]}],
+            known_signatures=_entry_signatures(entry),
         )
         cleanup = run_cleanup_from_scan(scan, roots=scan_paths)
         entry["remains_found"] = 0
@@ -82,7 +89,7 @@ def api_cleanup_purge_all():
             scan_paths = get_scan_paths(entry.get("item_type", "Movie"))
             scan = scan_copies_smart(
                 entry["item_title"], "", scan_paths,
-                known_signatures=[{"inode": None, "size": None, "hash": entry["source_hash"]}],
+                known_signatures=_entry_signatures(entry),
             )
             if scan["total_copies"] > 0:
                 cleanup = run_cleanup_from_scan(scan, roots=scan_paths)

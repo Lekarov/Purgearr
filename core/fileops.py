@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -102,6 +103,7 @@ def scan_copies_smart(
     known_path: str,
     extra_paths: List[str],
     known_signatures: Optional[List[Dict]] = None,
+    allow_name_fallback: bool = False,
 ) -> Dict:
     """
     Trouve les copies dans extra_paths par inode (hardlinks) puis hash SHA-256.
@@ -109,7 +111,11 @@ def scan_copies_smart(
     (une par fichier vidéo — un dossier série entière en a donc plusieurs).
     Si non fournies et que known_path existe encore (scan de prévisualisation
     avant suppression), elles sont calculées ici.
-    Aucun matching par titre — uniquement contenu identique.
+    Par défaut, aucun matching par titre — uniquement contenu identique (hash/inode).
+    allow_name_fallback=True ajoute une recherche par nom (variantes de séparateurs
+    tracker) en complément — réservé au scan manuel supervisé (jamais aux
+    suppressions automatiques webhook/queue, un mauvais match nom pourrait viser
+    le mauvais dossier).
     """
     known_real   = os.path.realpath(known_path) if known_path and os.path.exists(known_path) else ""
     known_is_dir = bool(known_path) and os.path.isdir(known_path)
@@ -123,15 +129,18 @@ def scan_copies_smart(
         source_size_bytes, _ = _calc_size(known_path)
 
     if not known_signatures:
+        name_matches = find_candidate_dirs_by_name(title, extra_paths) if allow_name_fallback else []
+        total = sum(e["size_bytes"] for e in name_matches)
         return {
             "title": title, "known_path": known_path, "source_hash": "",
             "source_size_bytes": source_size_bytes,
             "source_size_human": format_size(source_size_bytes),
-            "strategy": "indisponible", "copies": [], "total_copies": 0,
-            "total_size_bytes": 0, "total_size_human": format_size(0),
-            "total_freed_bytes": source_size_bytes,
-            "total_freed_human": format_size(source_size_bytes),
-            "has_inode_match": False, "skipped": True,
+            "strategy": "nom (aucun hash disponible)" if name_matches else "indisponible",
+            "copies": name_matches, "total_copies": len(name_matches),
+            "total_size_bytes": total, "total_size_human": format_size(total),
+            "total_freed_bytes": source_size_bytes + total,
+            "total_freed_human": format_size(source_size_bytes + total),
+            "has_inode_match": False, "skipped": not name_matches,
         }
 
     known_inodes = {s["inode"] for s in known_signatures if s.get("inode")}
@@ -249,8 +258,20 @@ def scan_copies_smart(
         except PermissionError as e:
             logger.warning("[Scan] Accès refusé à %s : %s", base, e)
 
+    if allow_name_fallback:
+        found_real = {os.path.realpath(e["path"]) for e in found}
+        for candidate in find_candidate_dirs_by_name(title, extra_paths):
+            real_c = os.path.realpath(candidate["path"])
+            if real_c in found_real or (known_real and (real_c == known_real or real_c.startswith(known_real + os.sep))):
+                continue
+            found.append(candidate)
+            found_real.add(real_c)
+
     total = sum(e["size_bytes"] for e in found)
-    total_freed = source_size_bytes + total
+    # Les hardlinks partagent les mêmes blocs disque que la source : les compter
+    # dans l'espace libéré double leur poids (source + copie = même donnée physique).
+    freed_from_copies = sum(e["size_bytes"] for e in found if not e["is_hardlink"])
+    total_freed = source_size_bytes + freed_from_copies
     return {
         "title":              title,
         "known_path":         known_path,
@@ -267,6 +288,84 @@ def scan_copies_smart(
         "has_inode_match":    any(e["is_hardlink"] for e in found),
         "skipped":            False,
     }
+
+
+# ── Recherche par nom (aperçu manuel uniquement — jamais pour suppression auto) ─
+
+_RELEASE_NOISE = re.compile(
+    r"\b(?:19|20)\d{2}\b|\bs\d{1,2}(?:e\d{1,3})?\b|\bseason\s?\d+\b|\bsaison\s?\d+\b"
+    r"|\b(1080p?|2160p?|720p?|480p?|4k|uhd|hdr10?|bluray|blu-?ray|bdrip|webrip|web-?dl|web|hdtv|dvdrip"
+    r"|x264|x265|hevc|aac|dts|ddp?5\.1|truehd|atmos|remux|complete|repack|proper"
+    r"|french|vf2?|vff|vfq|vostfr|multi|truefrench)\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_release_name(name: str) -> str:
+    """Normalise un nom de dossier/torrent selon les conventions trackers — points,
+    tirets et underscores interchangeables avec les espaces — pour comparer
+    'American.Dad', 'american-dad', 'American_Dad', 'AMERICAN DAD' etc."""
+    n = name.lower()
+    n = re.sub(r"[._\-]+", " ", n)
+    n = _RELEASE_NOISE.sub(" ", n)
+    n = re.sub(r"[^\w\s]", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def find_candidate_dirs_by_name(title: str, search_paths: List[str], max_depth: int = 2) -> List[Dict]:
+    """Recherche par NOM (pas par contenu) des dossiers pouvant correspondre à `title`
+    dans search_paths, jusqu'à max_depth sous-niveaux — gère les deux structures
+    courantes : dossier série contenant les saisons, OU dossiers de saison directement
+    à la racine (ex: 'American Dad S01', 'American.Dad.S02...').
+    Résultats NON vérifiés par contenu (pas de hash/inode) — à n'utiliser que pour un
+    aperçu supervisé par un humain, jamais pour une suppression automatique."""
+    needle = normalize_release_name(title)
+    needle_words = {w for w in needle.split() if len(w) >= 3}
+    if not needle_words:
+        return []
+
+    found: Dict[str, Dict] = {}
+    for base in search_paths:
+        base = base.strip()
+        if not base or not os.path.isdir(base):
+            continue
+        base_depth = base.rstrip(os.sep).count(os.sep)
+        try:
+            for root, dirs, _files in os.walk(base, followlinks=False):
+                depth = root.count(os.sep) - base_depth
+                if depth >= max_depth:
+                    dirs.clear()
+                    continue
+                matched_here = []
+                for d in dirs:
+                    dwords = set(normalize_release_name(d).split())
+                    if not dwords:
+                        continue
+                    # Tous les mots significatifs du titre doivent être présents dans
+                    # le nom du dossier — insensible à l'ordre (gère les variantes de
+                    # séparateurs/inversions utilisées par certains trackers).
+                    if needle_words <= dwords:
+                        full = os.path.join(root, d)
+                        if full not in found:
+                            size_bytes, file_count = _calc_size(full)
+                            found[full] = {
+                                "path":         full,
+                                "is_dir":       True,
+                                "size_bytes":   size_bytes,
+                                "size_human":   format_size(size_bytes),
+                                "file_count":   file_count,
+                                "match_method": "name",
+                                "is_hardlink":  False,
+                            }
+                        matched_here.append(d)
+                # Ne pas redescendre dans un dossier déjà retenu (ex: dossier série
+                # matché) : ses sous-dossiers (saisons/épisodes) matchent aussi le nom
+                # et seraient sinon comptés une deuxième fois en plus du parent.
+                for d in matched_here:
+                    dirs.remove(d)
+        except PermissionError as e:
+            logger.warning("[Scan nom] Accès refusé à %s : %s", base, e)
+    return list(found.values())
 
 
 # ── Suppression ───────────────────────────────────────────────────────────────
@@ -350,7 +449,9 @@ def run_cleanup_from_scan(scan_result: Dict, roots: Optional[List[str]] = None) 
             if r["success"]:
                 _prune_empty_parents(r["path"], roots)
     ok          = [r for r in results if r["success"]]
-    total_bytes = sum(r["size_bytes"] for r in ok)
+    # Idem : un hardlink supprimé ne libère aucun octet supplémentaire (même inode
+    # que la source), donc il ne compte pas dans l'espace réellement libéré.
+    total_bytes = sum(r["size_bytes"] for r in ok if not r.get("is_hardlink"))
     total_files = sum(r["file_count"] for r in ok)
 
     return {
@@ -376,13 +477,35 @@ def run_cleanup_from_scan(scan_result: Dict, roots: Optional[List[str]] = None) 
     }
 
 
-def run_cleanup(title: str, file_path: str, extra_paths: List[str], known_signatures: Optional[List[Dict]] = None) -> Dict:
+def run_cleanup(title: str, file_path: str, extra_paths: List[str], known_signatures: Optional[List[Dict]] = None,
+                 allow_name_fallback: bool = False) -> Dict:
     """
     Appelé depuis pipeline.py après suppression Radarr/Sonarr.
     known_signatures doit être précalculé AVANT la suppression (via collect_signatures)
     car le fichier/dossier source n'existe généralement plus au moment de cet appel.
+    allow_name_fallback : réservé aux suppressions manuelles (triggered_by="manual").
     """
     if not extra_paths:
         return {"skipped": True, "copies_found": 0}
-    scan = scan_copies_smart(title, file_path, extra_paths, known_signatures=known_signatures)
+    scan = scan_copies_smart(title, file_path, extra_paths, known_signatures=known_signatures,
+                              allow_name_fallback=allow_name_fallback)
     return run_cleanup_from_scan(scan, roots=extra_paths)
+
+
+def delete_selected_paths(paths: List[str], roots: Optional[List[str]] = None) -> Dict:
+    """Supprime une liste de chemins explicitement choisis (ex: candidats "nom" cochés
+    à la main par l'utilisateur dans la modal de confirmation). Aucun scan/matching —
+    les chemins sont pris tels quels, seule leur existence est vérifiée."""
+    entries = []
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        size_bytes, file_count = _calc_size(p)
+        entries.append({
+            "path": p, "is_dir": os.path.isdir(p),
+            "size_bytes": size_bytes, "file_count": file_count,
+            "match_method": "name", "is_hardlink": False,
+        })
+    if not entries:
+        return {"skipped": True, "copies_found": 0}
+    return run_cleanup_from_scan({"copies": entries}, roots=roots)

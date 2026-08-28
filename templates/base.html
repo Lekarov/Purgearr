@@ -99,12 +99,32 @@
       </div>
 
       <div style="background:var(--surface);border-radius:8px;padding:14px;
-                  margin-bottom:18px;max-height:260px;overflow-y:auto">
+                  margin-bottom:18px;max-height:220px;overflow-y:auto">
         <div style="font-size:10px;color:var(--text-muted);font-weight:600;
                     text-transform:uppercase;letter-spacing:0.6px;margin-bottom:10px">
           {{ t('modal.to_delete') }}
         </div>
         <ul id="dc-list" style="list-style:none;padding:0"></ul>
+      </div>
+
+      <div id="dc-name-section" style="display:none;background:var(--surface);border-radius:8px;
+                  padding:14px;margin-bottom:18px;border:1px solid var(--warning)">
+        <div style="display:flex;align-items:center;justify-content:space-between;
+                    flex-wrap:wrap;gap:8px;margin-bottom:10px">
+          <div style="font-size:10px;color:var(--warning);font-weight:600;
+                      text-transform:uppercase;letter-spacing:0.6px">
+            ⚠ {{ t('modal.to_verify_title') }}
+          </div>
+          <div style="display:flex;gap:6px">
+            <button type="button" class="btn btn-ghost btn-sm" onclick="_toggleAllNameMatches(true)">{{ t('modal.select_all') }}</button>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="_toggleAllNameMatches(false)">{{ t('modal.select_none') }}</button>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">
+          <span id="dc-name-selected-count">0</span> {{ t('modal.selected_of') }}
+          <span id="dc-name-total-count">0</span> · <span id="dc-name-selected-size">0 Ko</span>
+        </div>
+        <ul id="dc-name-list" style="list-style:none;padding:0;max-height:220px;overflow-y:auto"></ul>
       </div>
 
       <div style="display:flex;gap:10px;justify-content:flex-end">
@@ -296,9 +316,16 @@ function _showScanResults(label, scan) {
     strat.innerHTML = `<span style="color:var(--info)">🔍 ${LANG.hash_copies || 'Copies identiques — hash SHA-256 correspondant'}</span>` + dbg;
   }
 
-  document.getElementById('dc-count').textContent      = scan.total_copies   || '0';
+  // "Total libéré" ne compte que les copies vérifiées (hash/inode) — les matches
+  // "nom" sont optionnels (case à cocher) et ne libèrent rien tant qu'ils ne sont
+  // pas explicitement sélectionnés (voir _updateNameSelectionSummary).
+  const verifiedCopies = (scan.copies || []).filter(c => c.match_method !== 'name');
+  const verifiedFreedBytes = (scan.source_size_bytes || 0)
+    + verifiedCopies.reduce((s, c) => s + (c.is_hardlink ? 0 : (c.size_bytes || 0)), 0);
+
+  document.getElementById('dc-count').textContent      = verifiedCopies.length || '0';
   document.getElementById('dc-total').textContent      = scan.source_size_human || '—';
-  document.getElementById('dc-files-total').textContent = scan.total_freed_human || scan.source_size_human || '—';
+  document.getElementById('dc-files-total').textContent = _formatBytes(verifiedFreedBytes);
 
   const list = document.getElementById('dc-list');
   list.innerHTML = '';
@@ -324,12 +351,67 @@ function _showScanResults(label, scan) {
 
   _addConfirmRow(list, 'Jellyfin', LANG.jelly_detail || 'Refresh bibliothèque', 'var(--info)', '🎬', lk.jellyfin || null);
 
-  (scan.copies || []).forEach(c => {
+  // Copies vérifiées (hash/inode) — supprimées automatiquement, pas de case à cocher.
+  (scan.copies || []).filter(c => c.match_method !== 'name').forEach(c => {
     const badge = c.match_method === 'inode' ? '🔗 inode' : '🔍 hash';
     const color = c.match_method === 'inode' ? 'var(--success)' : 'var(--info)';
     const fLabel = c.file_count > 1 ? (LANG.file_plural || 'fichiers') : (LANG.file_singular || 'fichier');
     _addConfirmRow(list, c.path, `${c.size_human} · ${c.file_count} ${fLabel} · ${badge}`, color, '🗑️');
   });
+
+  // Copies "nom" — non vérifiées par contenu, sélection manuelle obligatoire.
+  const nameSection = document.getElementById('dc-name-section');
+  const nameList    = document.getElementById('dc-name-list');
+  nameList.innerHTML = '';
+  const nameMatches = (scan.copies || []).filter(c => c.match_method === 'name');
+  _pendingDelete.nameMatches = nameMatches;
+
+  if (nameMatches.length === 0) {
+    nameSection.style.display = 'none';
+  } else {
+    nameSection.style.display = 'block';
+    nameMatches.forEach((c, idx) => {
+      const fLabel = c.file_count > 1 ? (LANG.file_plural || 'fichiers') : (LANG.file_singular || 'fichier');
+      const li = document.createElement('li');
+      li.style.cssText = 'padding:8px 0;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:flex-start';
+      li.innerHTML = `
+        <input type="checkbox" data-name-idx="${idx}" onchange="_updateNameSelectionSummary()"
+               style="margin-top:3px;flex-shrink:0;cursor:pointer">
+        <div style="min-width:0;flex:1">
+          <div style="font-family:monospace;font-size:11px;color:var(--warning);word-break:break-all">${esc(c.path)}</div>
+          <div style="font-size:11px;color:var(--text-muted);margin-top:2px">${c.size_human} · ${c.file_count} ${fLabel}</div>
+        </div>`;
+      nameList.appendChild(li);
+    });
+    _updateNameSelectionSummary();
+  }
+}
+
+function _toggleAllNameMatches(checked) {
+  document.querySelectorAll('#dc-name-list input[type=checkbox]').forEach(cb => { cb.checked = checked; });
+  _updateNameSelectionSummary();
+}
+
+function _updateNameSelectionSummary() {
+  const matches = (_pendingDelete && _pendingDelete.nameMatches) || [];
+  const boxes = document.querySelectorAll('#dc-name-list input[type=checkbox]');
+  let selectedCount = 0, selectedBytes = 0;
+  boxes.forEach(cb => {
+    if (cb.checked) {
+      selectedCount++;
+      const m = matches[parseInt(cb.dataset.nameIdx, 10)];
+      if (m) selectedBytes += m.size_bytes || 0;
+    }
+  });
+  document.getElementById('dc-name-selected-count').textContent = selectedCount;
+  document.getElementById('dc-name-total-count').textContent    = matches.length;
+  document.getElementById('dc-name-selected-size').textContent  = _formatBytes(selectedBytes);
+}
+
+function _formatBytes(bytes) {
+  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + ' Go';
+  if (bytes >= 1048576)    return (bytes / 1048576).toFixed(1) + ' Mo';
+  return (bytes / 1024).toFixed(1) + ' Ko';
 }
 
 function _addConfirmRow(ul, path, detail, color, icon, href) {
@@ -368,12 +450,22 @@ async function confirmDelete() {
   document.getElementById('dc-results').style.display    = 'none';
   document.getElementById('dc-processing').style.display = 'block';
 
+  const nameMatches = _pendingDelete.nameMatches || [];
+  const selectedPaths = [];
+  document.querySelectorAll('#dc-name-list input[type=checkbox]').forEach(cb => {
+    if (cb.checked) {
+      const m = nameMatches[parseInt(cb.dataset.nameIdx, 10)];
+      if (m) selectedPaths.push(m.path);
+    }
+  });
+
   const fd = new FormData();
   fd.append('jellyfin_item_id', id);
   fd.append('item_type', type);
   fd.append('item_title', title);
   fd.append('series_title', seriesTitle || '');
   fd.append('source_hash', sourceHash || '');
+  fd.append('selected_name_paths', JSON.stringify(selectedPaths));
 
   try {
     const res  = await fetch('/api/delete/manual', { method: 'POST', body: fd });

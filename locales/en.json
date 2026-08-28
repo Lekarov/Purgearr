@@ -42,7 +42,11 @@
     "cleanup_title": "Cleanup report",
     "copies_deleted": "Deleted",
     "files_erased": "Files erased",
-    "space_freed": "Space freed"
+    "space_freed": "Space freed",
+    "to_verify_title": "To review — matched by name, not content",
+    "select_all": "Select all",
+    "select_none": "Deselect all",
+    "selected_of": "selected of"
   },
   "dashboard": {
     "title": "Dashboard",
