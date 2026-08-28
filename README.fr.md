@@ -61,7 +61,8 @@ Jamais regardé. Jamais regarderas. Supprimé.
 - **Paramètres** — configuration complète depuis l'interface web, sans édition de fichier
 - **Multi-utilisateurs** — définir des spectateurs requis ; la suppression n'est suggérée que quand tous ont regardé
 - **Multi-tracker** — détecte tous les torrents qui seedent le même fichier sur plusieurs trackers, dédupliqué pour le calcul de taille
-- **Détection hardlinks** — scan inode + SHA-256 avant suppression pour détecter les copies
+- **Détection hardlinks** — scan inode + SHA-256 avant suppression pour détecter les copies, correctement exclues du total d'espace libéré (elles partagent les mêmes blocs disque que la source)
+- **Matching par nom supervisé** — quand le hash/inode seul ne suffit pas (ex: une saison éparpillée sous des noms de release différents), une recherche par nom optionnelle fait remonter des candidats supplémentaires ; tu choisis toi-même lesquels supprimer via des cases à cocher, jamais supprimés automatiquement
 - **Modal de confirmation** — affiche exactement ce qui sera supprimé avant chaque action
 - **Langue** — 6 langues
 

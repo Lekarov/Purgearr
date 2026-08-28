@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
     stop_scheduler()
 
 
-app = FastAPI(title="Purgearr", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Purgearr", version="0.5.0-beta", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.include_router(webhook_router)
 app.include_router(dashboard_router)

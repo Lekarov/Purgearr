@@ -61,7 +61,8 @@ Never watched it. Never will. Gone.
 - **Settings** — full configuration from the web UI, no file editing required
 - **Multi-user** — define required watchers; deletion is only suggested when all have watched
 - **Multi-tracker** — detects all torrents seeding the same file across multiple trackers, deduplicated for size calculation
-- **Hardlink detection** — inode + SHA-256 scan before deletion to catch duplicate copies
+- **Hardlink detection** — inode + SHA-256 scan before deletion to catch duplicate copies, correctly excluded from the freed-space total (they share the same disk blocks as the source)
+- **Reviewed name matching** — when hash/inode alone isn't enough (e.g. a whole season spread across differently-named tracker releases), an optional name-based search surfaces extra candidates; you pick exactly which ones to delete via checkboxes, never deleted automatically
 - **Confirmation modal** — shows exactly what will be removed before any deletion
 - **Language** — 6 languages
 
