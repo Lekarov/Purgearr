@@ -104,178 +104,57 @@ def scan_copies_smart(
     extra_paths: List[str],
     known_signatures: Optional[List[Dict]] = None,
     allow_name_fallback: bool = False,
+    torrents: Optional[List[Dict]] = None,
 ) -> Dict:
     """
-    Trouve les copies dans extra_paths par inode (hardlinks) puis hash SHA-256.
-    known_signatures : signatures pré-calculées avant suppression Radarr/Sonarr
-    (une par fichier vidéo — un dossier série entière en a donc plusieurs).
-    Si non fournies et que known_path existe encore (scan de prévisualisation
-    avant suppression), elles sont calculées ici.
-    Par défaut, aucun matching par titre — uniquement contenu identique (hash/inode).
-    allow_name_fallback=True ajoute une recherche par nom (variantes de séparateurs
-    tracker) en complément — réservé au scan manuel supervisé (jamais aux
-    suppressions automatiques webhook/queue, un mauvais match nom pourrait viser
-    le mauvais dossier).
+    Trouve toutes les copies du contenu ciblé (voir core.locator) : hardlinks
+    (inode), copies physiques (taille + empreinte), liens symboliques cross-seed,
+    dans tout le dossier de téléchargements — regroupées en unités sûres (un
+    dossier n'est retenu que si TOUTES ses vidéos sont ce contenu).
+    torrents : liste Transmission ; si fournie, les torrents correspondants sont
+    renvoyés dans "torrents" (identité de fichier, jamais par nom).
+    allow_name_fallback=True ajoute des candidats par nom, NON vérifiés, à cocher
+    à la main — jamais utilisés pour une suppression automatique.
     """
-    known_real   = os.path.realpath(known_path) if known_path and os.path.exists(known_path) else ""
-    known_is_dir = bool(known_path) and os.path.isdir(known_path)
+    from core.locator import locate
 
-    if known_signatures is None:
-        known_signatures = collect_signatures(known_path)
-
-    # Taille du fichier/dossier source (pour affichage dans la modal)
+    known_real = os.path.realpath(known_path) if known_path and os.path.exists(known_path) else ""
     source_size_bytes = 0
-    if known_path and (os.path.isfile(known_path) or os.path.isdir(known_path)):
+    if known_real:
         source_size_bytes, _ = _calc_size(known_path)
 
-    if not known_signatures:
-        name_matches = find_candidate_dirs_by_name(title, extra_paths) if allow_name_fallback else []
-        total = sum(e["size_bytes"] for e in name_matches)
-        return {
-            "title": title, "known_path": known_path, "source_hash": "",
-            "source_size_bytes": source_size_bytes,
-            "source_size_human": format_size(source_size_bytes),
-            "strategy": "nom (aucun hash disponible)" if name_matches else "indisponible",
-            "copies": name_matches, "total_copies": len(name_matches),
-            "total_size_bytes": total, "total_size_human": format_size(total),
-            "total_freed_bytes": source_size_bytes + total,
-            "total_freed_human": format_size(source_size_bytes + total),
-            "has_inode_match": False, "skipped": not name_matches,
-        }
-
-    known_inodes = {s["inode"] for s in known_signatures if s.get("inode")}
-    by_size: Dict[int, List[Dict]] = {}
-    # signatures sans taille connue (ex: hash historique seul depuis cleanup_index.json)
-    # — impossible de les préfiltrer par taille, on les compare à tout fichier candidat
-    hash_only: List[Dict] = []
-    for s in known_signatures:
-        if s.get("size") is not None:
-            by_size.setdefault(s["size"], []).append(s)
-        elif s.get("hash"):
-            hash_only.append(s)
-
-    strategy = "inode+hash" if known_inodes else "hash"
-    found: List[Dict] = []
-    reported: set = set()  # global à tous les base paths pour éviter les doublons
-
-    for base in extra_paths:
-        base = base.strip()
-        if not base or not os.path.isdir(base):
-            logger.warning("[Scan] Chemin ignoré (introuvable) : %s", base)
-            continue
-
-        base_depth = base.rstrip(os.sep).count(os.sep)
-
-        try:
-            for root, dirs, files in os.walk(base, followlinks=False):
-                depth = root.count(os.sep) - base_depth
-                if depth >= 5:
-                    dirs.clear()
-                    continue
-
-                for fname in files:
-                    if Path(fname).suffix.lower() not in VIDEO_EXTENSIONS:
-                        continue
-                    fpath = os.path.join(root, fname)
-
-                    # Ignorer les fichiers appartenant au dossier/fichier source
-                    try:
-                        real_fpath = os.path.realpath(fpath)
-                        if known_real:
-                            if known_is_dir and real_fpath.startswith(known_real + os.sep):
-                                continue
-                            elif not known_is_dir and real_fpath == known_real:
-                                continue
-                    except Exception:
-                        pass
-
-                    match_method: Optional[str] = None
-                    finode = _inode_key(fpath)
-                    if finode and finode in known_inodes:
-                        match_method = "inode"
-                    else:
-                        # Préfiltre par taille quand connue (rapide, évite d'ouvrir le fichier) ;
-                        # les signatures sans taille (hash_only) sont testées systématiquement
-                        try:
-                            fsize = os.path.getsize(fpath)
-                        except OSError:
-                            continue
-                        candidates = by_size.get(fsize, []) + hash_only
-                        if candidates:
-                            fhash = _file_hash(fpath)
-                            if any(fhash == c["hash"] for c in candidates if c.get("hash")):
-                                match_method = "hash"
-
-                    if not match_method:
-                        continue
-
-                    # Dossier parent du fichier trouvé = dossier release
-                    # SAUF si ce parent est un dossier catégorie (film/, série/…)
-                    # contenant plusieurs films — dans ce cas on ne prend que le fichier.
-                    parent = os.path.dirname(fpath)
-                    if os.path.normpath(parent) == os.path.normpath(base):
-                        release = fpath   # fichier directement dans base
-                    else:
-                        try:
-                            video_siblings = sum(
-                                1 for f in os.scandir(parent)
-                                if f.is_file() and Path(f.name).suffix.lower() in VIDEO_EXTENSIONS
-                            )
-                        except Exception:
-                            video_siblings = 1
-                        if video_siblings <= 4:
-                            release = parent  # vrai dossier release (1 film)
-                        else:
-                            release = fpath   # dossier catégorie → fichier seul
-
-                    if release in reported:
-                        continue
-                    reported.add(release)
-
-                    # Ignorer si c'est la source elle-même
-                    try:
-                        real_release = os.path.realpath(release)
-                        if known_real:
-                            if known_is_dir and real_release == known_real:
-                                continue
-                            elif not known_is_dir and real_release == os.path.dirname(known_real):
-                                continue
-                    except Exception:
-                        pass
-
-                    size_bytes, file_count = _calc_size(release)
-                    found.append({
-                        "path":         release,
-                        "is_dir":       os.path.isdir(release),
-                        "size_bytes":   size_bytes,
-                        "size_human":   format_size(size_bytes),
-                        "file_count":   file_count,
-                        "match_method": match_method,
-                        "is_hardlink":  match_method == "inode",
-                    })
-                    logger.info("[Scan] Copie trouvée (%s) : %s", match_method, release)
-
-        except PermissionError as e:
-            logger.warning("[Scan] Accès refusé à %s : %s", base, e)
+    loc = locate(known_path, known_signatures=known_signatures, torrents=torrents)
+    found = list(loc["copies"])
 
     if allow_name_fallback:
         found_real = {os.path.realpath(e["path"]) for e in found}
+        torrent_roots = {os.path.realpath(t["host_root"]) for t in loc["torrents"] if t.get("host_root")}
         for candidate in find_candidate_dirs_by_name(title, extra_paths):
             real_c = os.path.realpath(candidate["path"])
-            if real_c in found_real or (known_real and (real_c == known_real or real_c.startswith(known_real + os.sep))):
+            if real_c in found_real or real_c in torrent_roots:
+                continue
+            if known_real and (real_c == known_real or real_c.startswith(known_real + os.sep)
+                               or known_real.startswith(real_c + os.sep)):
+                continue
+            if any(real_c.startswith(f + os.sep) or f.startswith(real_c + os.sep) for f in found_real):
                 continue
             found.append(candidate)
             found_real.add(real_c)
 
+    sigs = loc["signatures"]
+    verified = [e for e in found if e["match_method"] != "name"]
     total = sum(e["size_bytes"] for e in found)
-    # Les hardlinks partagent les mêmes blocs disque que la source : les compter
-    # dans l'espace libéré double leur poids (source + copie = même donnée physique).
-    freed_from_copies = sum(e["size_bytes"] for e in found if not e["is_hardlink"])
+    # Hardlinks / liens symboliques : mêmes blocs disque que la source → 0 octet libéré
+    freed_from_copies = sum(e["size_bytes"] for e in verified if not e["is_hardlink"])
     total_freed = source_size_bytes + freed_from_copies
+    if not sigs:
+        strategy = "nom (aucune empreinte disponible)" if found else "indisponible"
+    else:
+        strategy = "inode+hash" if any(s.get("inode") for s in sigs) else "hash"
     return {
         "title":              title,
         "known_path":         known_path,
-        "source_hash":        known_signatures[0]["hash"] if known_signatures else "",
+        "source_hash":        sigs[0]["hash"] if sigs else "",
         "source_size_bytes":  source_size_bytes,
         "source_size_human":  format_size(source_size_bytes),
         "strategy":           strategy,
@@ -285,8 +164,10 @@ def scan_copies_smart(
         "total_size_human":   format_size(total),
         "total_freed_bytes":  total_freed,
         "total_freed_human":  format_size(total_freed),
-        "has_inode_match":    any(e["is_hardlink"] for e in found),
-        "skipped":            False,
+        "has_inode_match":    any(e["is_hardlink"] for e in verified),
+        "skipped":            not found,
+        "torrents":           loc["torrents"],
+        "signatures":         sigs,
     }
 
 
@@ -310,6 +191,22 @@ def normalize_release_name(name: str) -> str:
     n = _RELEASE_NOISE.sub(" ", n)
     n = re.sub(r"[^\w\s]", " ", n)
     return re.sub(r"\s+", " ", n).strip()
+
+
+def _name_is_same_title(needle: str, dirname: str) -> bool:
+    """Le nom normalisé doit COMMENCER par le titre, et ce qui suit ne doit pas
+    être un numéro de suite : « Cars » ne doit pas attraper « Cars 2 » ni
+    « Cars 3 », « Scream » ne doit pas attraper « Scream 4 »."""
+    norm = normalize_release_name(dirname)
+    if not norm.startswith(needle):
+        return False
+    rest = norm[len(needle):]
+    if rest and not rest.startswith(" "):
+        return False   # « carsten » ≠ « cars »
+    nxt = rest.split()[:1]
+    if nxt and (nxt[0].isdigit() or nxt[0] in {"ii", "iii", "iv", "v", "vi"}):
+        return False
+    return True
 
 
 def find_candidate_dirs_by_name(title: str, search_paths: List[str], max_depth: int = 2) -> List[Dict]:
@@ -344,7 +241,7 @@ def find_candidate_dirs_by_name(title: str, search_paths: List[str], max_depth: 
                     # Tous les mots significatifs du titre doivent être présents dans
                     # le nom du dossier — insensible à l'ordre (gère les variantes de
                     # séparateurs/inversions utilisées par certains trackers).
-                    if needle_words <= dwords:
+                    if needle_words <= dwords and _name_is_same_title(needle, d):
                         full = os.path.join(root, d)
                         if full not in found:
                             size_bytes, file_count = _calc_size(full)
@@ -373,7 +270,9 @@ def find_candidate_dirs_by_name(title: str, search_paths: List[str], max_depth: 
 def delete_copy(entry: Dict) -> Dict:
     path = entry["path"]
     try:
-        if entry["is_dir"]:
+        if os.path.islink(path):
+            os.unlink(path)
+        elif entry["is_dir"]:
             shutil.rmtree(path)
         else:
             os.remove(path)
@@ -388,6 +287,29 @@ def delete_copy(entry: Dict) -> Dict:
         return {**entry, "success": False, "error": str(e)}
 
 
+def _is_category(p) -> bool:
+    """Dossiers de catégorie (downloads/complete/film, downloads/série/Fallout,
+    downloads/.cross-seed-links/C411…) : jamais supprimés, même vides —
+    Transmission/Radarr/Sonarr y écrivent."""
+    try:
+        from core.locator import downloads_root
+        dl = os.path.normpath(downloads_root() or "")
+    except Exception:
+        return False
+    p = os.path.normpath(str(p))
+    if not dl or not (p == dl or p.startswith(dl + os.sep)):
+        return False
+    parts = os.path.relpath(p, dl).split(os.sep)
+    if parts == ["."] or len(parts) <= 1:
+        return True
+    if len(parts) == 2:
+        # film/<Release> est un dossier de film, pas une catégorie
+        from config import get_config
+        movies = os.path.normpath(get_config().get("library_root_movies", "") or "")
+        return os.path.join(dl, parts[0]) != movies
+    return False
+
+
 def _prune_empty_parents(path: str, roots: List[str]):
     """
     Remonte l'arborescence depuis le parent de path et supprime les dossiers devenus
@@ -397,7 +319,8 @@ def _prune_empty_parents(path: str, roots: List[str]):
     """
     roots_norm = {os.path.normpath(r) for r in roots if r and r.strip()}
     parent = os.path.dirname(os.path.normpath(path))
-    while parent and os.path.isdir(parent) and os.path.normpath(parent) not in roots_norm:
+    while parent and os.path.isdir(parent) and os.path.normpath(parent) not in roots_norm \
+            and not _is_category(parent):
         try:
             if os.listdir(parent):
                 break
@@ -427,7 +350,8 @@ def _delete_companions(file_path: str):
                 pass
     try:
         remaining = list(parent.iterdir())
-        if all(f.is_file() and f.suffix.lower() in METADATA_EXTENSIONS for f in remaining):
+        if not _is_category(parent) and \
+                all(f.is_file() and f.suffix.lower() in METADATA_EXTENSIONS for f in remaining):
             for f in remaining:
                 try:
                     Path(f).unlink()
@@ -478,18 +402,32 @@ def run_cleanup_from_scan(scan_result: Dict, roots: Optional[List[str]] = None) 
 
 
 def run_cleanup(title: str, file_path: str, extra_paths: List[str], known_signatures: Optional[List[Dict]] = None,
-                 allow_name_fallback: bool = False) -> Dict:
+                 allow_name_fallback: bool = False, precomputed_scan: Optional[Dict] = None) -> Dict:
     """
     Appelé depuis pipeline.py après suppression Radarr/Sonarr.
     known_signatures doit être précalculé AVANT la suppression (via collect_signatures)
     car le fichier/dossier source n'existe généralement plus au moment de cet appel.
     allow_name_fallback : réservé aux suppressions manuelles (triggered_by="manual").
     """
+    if precomputed_scan is not None:
+        result = run_cleanup_from_scan(precomputed_scan, roots=extra_paths)
+        _invalidate()
+        return result
     if not extra_paths:
         return {"skipped": True, "copies_found": 0}
     scan = scan_copies_smart(title, file_path, extra_paths, known_signatures=known_signatures,
                               allow_name_fallback=allow_name_fallback)
-    return run_cleanup_from_scan(scan, roots=extra_paths)
+    result = run_cleanup_from_scan(scan, roots=extra_paths)
+    _invalidate()
+    return result
+
+
+def _invalidate():
+    try:
+        from core.locator import invalidate_index
+        invalidate_index()
+    except Exception:
+        pass
 
 
 def delete_selected_paths(paths: List[str], roots: Optional[List[str]] = None) -> Dict:

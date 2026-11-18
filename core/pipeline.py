@@ -8,9 +8,10 @@ from typing import Dict, List, Optional
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from config import get_rules, get_scan_paths
+from config import get_config, get_rules, get_scan_paths
 from core import eventlog
-from core.fileops import _calc_size, collect_signatures, delete_selected_paths, format_size, run_cleanup
+from core.fileops import _calc_size, delete_selected_paths, format_size, run_cleanup, scan_copies_smart
+from core.locator import source_unit
 from database import DeletionHistory
 from services.factory import get_jellyfin, get_radarr, get_sonarr, get_transmission
 
@@ -155,35 +156,59 @@ def dedupe_deletion_history(db: Session) -> int:
     return removed
 
 
-def _stop_all_torrents(file_path: str, title: str) -> List[Dict]:
-    """Cherche et stoppe TOUS les torrents correspondants. Retourne [{name, tracker_name, tracker_url}]."""
+def _locate_all(file_path: str, title: str, item_type: str) -> tuple:
+    """Recherche exacte AVANT toute suppression : torrents + copies par identité
+    de fichier (chemin / inode / taille+empreinte / lien cross-seed)."""
+    torrents: List[Dict] = []
+    try:
+        torrents = get_transmission().get_all_torrents()
+    except Exception as e:
+        logger.warning(f"[Transmission] Liste indisponible : {e}")
+        eventlog.warning("service", f"Transmission KO pour '{title}' : {e}")
+    scan = scan_copies_smart(title, file_path, get_scan_paths(item_type), torrents=torrents)
+    return scan, torrents
+
+
+def _remove_torrents(matched: List[Dict], title: str) -> List[Dict]:
+    """Retire de Transmission les torrents trouvés par _locate_all (sans toucher
+    aux données : les fichiers sont supprimés par Radarr/Sonarr et le nettoyage)."""
     from services.transmission import get_tracker_info
     results: List[Dict] = []
+    if not matched:
+        return results
     try:
         tr = get_transmission()
-        torrents = tr.find_all_by_path_or_name(file_path, title)
-        if not torrents:
-            return results
-        for torrent in torrents:
+        for torrent in matched:
             tr.stop_and_remove(torrent["id"], delete_data=False)
-            logger.info(f"[Transmission] Torrent supprimé : {torrent['name']}")
+            logger.info(f"[Transmission] Torrent supprimé ({torrent.get('match_method')}) : {torrent['name']}")
             tname, turl = get_tracker_info(torrent)
-            results.append({"name": torrent["name"], "tracker_name": tname, "tracker_url": turl})
+            results.append({"name": torrent["name"], "tracker_name": tname, "tracker_url": turl,
+                            "match_method": torrent.get("match_method")})
     except Exception as e:
         logger.warning(f"[Transmission] Erreur pour '{title}': {e}")
         eventlog.warning("service", f"Transmission KO pour '{title}' : {e}")
     return results
 
 
-def _delete_path_direct(path: str) -> bool:
+def _sigs_for_store(sigs: List[Dict]) -> List[Dict]:
+    return [{"size": s.get("size"), "hash": s.get("hash")} for s in sigs if s.get("hash")]
+
+
+def _delete_path_direct(path: str, torrents: Optional[List[Dict]] = None) -> bool:
     """Supprime un fichier/dossier directement sur le disque (fallback quand Sonarr/Radarr
-    ne connaît pas l'item — ex: série seedée manuellement, jamais importée dans Sonarr)."""
+    ne connaît pas l'item — ex: média seedé manuellement, jamais importé).
+    Un fichier est supprimé avec son dossier release seulement si ce dossier ne
+    contient aucune autre vidéo (jamais un dossier de catégorie)."""
+    from core.fileops import _delete_companions
     if not path or not os.path.exists(path):
         return False
-    if os.path.isdir(path):
-        shutil.rmtree(path)
+    unit = source_unit(path, torrents) or path
+    if os.path.isdir(unit):
+        shutil.rmtree(unit)
     else:
-        os.remove(path)
+        os.remove(unit)
+        _delete_companions(unit)
+    logger.info(f"[Fileops] Suppression directe : {unit}")
     return True
 
 
@@ -220,7 +245,8 @@ def delete_movie(db: Session, item: Dict, triggered_by: str, source_hash: str = 
 
     # 0.5 Empreintes AVANT suppression — pour retrouver toutes les copies (fichier
     # unique ou dossier entier) une fois Radarr aura supprimé la source
-    known_signatures = collect_signatures(file_path) if file_path else []
+    scan, all_torrents = _locate_all(file_path, title, "Movie")
+    known_signatures = scan.get("signatures") or []
     if not source_hash and known_signatures:
         source_hash = known_signatures[0]["hash"]
         logger.debug(f"[Pipeline] Hash source calculé avant suppression : {source_hash[:12]}…")
@@ -228,8 +254,9 @@ def delete_movie(db: Session, item: Dict, triggered_by: str, source_hash: str = 
     # Taille du fichier source (avant que Radarr ne le supprime)
     file_size = _calc_size(file_path)[0] if file_path and os.path.exists(file_path) else 0
 
-    # 1. Transmission — stop TOUS les torrents seedant ce fichier (multi-tracker)
-    torrents_info = _stop_all_torrents(file_path, title)
+    # 1. Transmission — TOUS les torrents dont un fichier est ce film (multi-tracker,
+    # cross-seed), trouvés par identité de fichier et non plus par ressemblance de nom
+    torrents_info = _remove_torrents(scan.get("torrents") or [], title)
     torrent_names = [t["name"] for t in torrents_info]
     if torrents_info:
         result["services"].append("transmission")
@@ -241,6 +268,7 @@ def delete_movie(db: Session, item: Dict, triggered_by: str, source_hash: str = 
         add_entry(
             item_title=title, item_type="Movie", source_hash=source_hash,
             source_hashes=[s["hash"] for s in known_signatures if s.get("hash")],
+            source_sigs=_sigs_for_store(known_signatures),
             file_path=file_path, jellyfin_item_id=item.get("jellyfin_id", ""),
             file_size_bytes=file_size, torrent_name=", ".join(torrent_names) if torrent_names else None,
             scan_paths=get_scan_paths("Movie"),
@@ -251,15 +279,16 @@ def delete_movie(db: Session, item: Dict, triggered_by: str, source_hash: str = 
     # 2. Radarr — supprime le film, les fichiers, et bloque le re-téléchargement
     try:
         radarr = get_radarr()
-        movie = None
-        if item.get("tmdb_id"):
+        movie = radarr.find_by_path(file_path) if file_path else None
+        if not movie and item.get("tmdb_id"):
             try:
                 movie = radarr.find_by_tmdb_id(int(item["tmdb_id"]))
             except (TypeError, ValueError):
                 movie = None
         if not movie and item.get("imdb_id"):
             movie = radarr.find_by_imdb_id(item["imdb_id"])
-        if not movie:
+        if not movie and not file_path:
+            # le titre seul peut désigner un autre film (remake) : seulement sans chemin
             movie = radarr.find_by_title(title)
         if movie:
             radarr.delete(
@@ -271,15 +300,21 @@ def delete_movie(db: Session, item: Dict, triggered_by: str, source_hash: str = 
             result["success"] = True
             logger.info(f"[Radarr] Film supprimé : {title} (id={movie['id']})")
         else:
-            logger.warning(f"[Radarr] Film introuvable : {title}")
-            result["errors"].append("Radarr: film introuvable")
+            # Film absent de Radarr (déposé à la main / seedé directement dans film/) :
+            # suppression directe du fichier réel résolu depuis Jellyfin
+            logger.info(f"[Radarr] Film absent de Radarr, suppression directe : {title}")
+            if rules.get("delete_files", True) and _delete_path_direct(file_path, all_torrents):
+                result["services"].append("filesystem")
+                result["success"] = True
+            else:
+                result["errors"].append("Radarr: film introuvable et fichier source introuvable")
     except Exception as e:
         result["errors"].append(f"Radarr: {e}")
         logger.error(f"[Radarr] Erreur pour '{title}': {e}")
 
     # 2.5 Nettoyage des copies (signatures pré-calculées = pas de fallback titre hasardeux)
     try:
-        result["cleanup"] = run_cleanup(title, file_path, get_scan_paths("Movie"), known_signatures=known_signatures)
+        result["cleanup"] = run_cleanup(title, file_path, get_scan_paths("Movie"), precomputed_scan=scan)
         if extra_delete_paths:
             selected = delete_selected_paths(extra_delete_paths, roots=get_scan_paths("Movie"))
             result["cleanup"] = _merge_cleanup_results(result["cleanup"], selected)
@@ -366,15 +401,25 @@ def delete_episode(db: Session, item: Dict, triggered_by: str, source_hash: str 
 
     # 0.5 Empreintes AVANT suppression — pour retrouver toutes les copies (épisode
     # unique ou dossier série entière) une fois Sonarr aura supprimé la source
-    known_signatures = collect_signatures(file_path) if file_path else []
+    cleanup_title = series_title if delete_mode == "series" else title
+    locate_path = file_path
+    if delete_mode == "series" and file_path and os.path.isfile(file_path):
+        # Série entière demandée depuis un épisode : la cible est le dossier série
+        lib = (get_config().get("library_root_series") or "").rstrip("/")
+        if lib and file_path.startswith(lib + "/"):
+            locate_path = os.path.join(lib, os.path.relpath(file_path, lib).split(os.sep)[0])
+    scan, all_torrents = _locate_all(locate_path, cleanup_title, "Episode")
+    known_signatures = scan.get("signatures") or []
     if not source_hash and known_signatures:
         source_hash = known_signatures[0]["hash"]
 
     # Taille du fichier source (avant que Sonarr ne le supprime)
     file_size = _calc_size(file_path)[0] if file_path and os.path.exists(file_path) else 0
 
-    # 1. Transmission — stop TOUS les torrents seedant cet épisode (multi-tracker)
-    torrents_info = _stop_all_torrents(file_path, series_title)
+    # 1. Transmission — uniquement les torrents qui contiennent CE fichier/dossier
+    # (avant : tous les torrents dont le nom ressemblait à la série, même pour un
+    # seul épisode)
+    torrents_info = _remove_torrents(scan.get("torrents") or [], series_title)
     torrent_names = [t["name"] for t in torrents_info]
     if torrents_info:
         result["services"].append("transmission")
@@ -386,6 +431,7 @@ def delete_episode(db: Session, item: Dict, triggered_by: str, source_hash: str 
         add_entry(
             item_title=title, item_type="Episode", source_hash=source_hash,
             source_hashes=[s["hash"] for s in known_signatures if s.get("hash")],
+            source_sigs=_sigs_for_store(known_signatures),
             file_path=file_path, series_title=series_title,
             jellyfin_item_id=item.get("jellyfin_id", ""),
             file_size_bytes=file_size, torrent_name=", ".join(torrent_names) if torrent_names else None,
@@ -397,8 +443,8 @@ def delete_episode(db: Session, item: Dict, triggered_by: str, source_hash: str 
     # 2. Sonarr
     try:
         sonarr = get_sonarr()
-        series = None
-        if item.get("tvdb_id"):
+        series = sonarr.find_by_path(file_path) if file_path else None
+        if not series and item.get("tvdb_id"):
             try:
                 series = sonarr.find_by_tvdb_id(int(item["tvdb_id"]))
             except (TypeError, ValueError):
@@ -412,7 +458,7 @@ def delete_episode(db: Session, item: Dict, triggered_by: str, source_hash: str 
             # source (déjà résolu depuis Jellyfin) plutôt que d'échouer.
             logger.info(f"[Sonarr] Série introuvable, suppression directe : {series_title}")
             try:
-                if rules.get("delete_files", True) and _delete_path_direct(file_path):
+                if rules.get("delete_files", True) and _delete_path_direct(locate_path, all_torrents):
                     result["services"].append("filesystem")
                     result["success"] = True
                     logger.info(f"[Fileops] Suppression directe (hors Sonarr) : {file_path}")
@@ -435,8 +481,10 @@ def delete_episode(db: Session, item: Dict, triggered_by: str, source_hash: str 
             file_path = item.get("file_path", "")
             ep_files = sonarr.get_episode_files(series["id"])
             deleted = False
+            from core.locator import to_container
+            wanted = to_container(file_path, ["/media/série", "/downloads"]) if file_path else set()
             for ef in ep_files:
-                if file_path and ef.get("path", "") == file_path:
+                if file_path and ef.get("path", "") in wanted:
                     sonarr.delete_episode_file(ef["id"])
                     deleted = True
                     break
@@ -463,8 +511,7 @@ def delete_episode(db: Session, item: Dict, triggered_by: str, source_hash: str 
 
     # 2.5 Nettoyage des copies (signatures pré-calculées)
     try:
-        cleanup_title = series_title if delete_mode == "series" else title
-        result["cleanup"] = run_cleanup(cleanup_title, file_path, get_scan_paths("Episode"), known_signatures=known_signatures)
+        result["cleanup"] = run_cleanup(cleanup_title, file_path, get_scan_paths("Episode"), precomputed_scan=scan)
         if extra_delete_paths:
             selected = delete_selected_paths(extra_delete_paths, roots=get_scan_paths("Episode"))
             result["cleanup"] = _merge_cleanup_results(result["cleanup"], selected)

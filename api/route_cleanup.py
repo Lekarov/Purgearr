@@ -13,6 +13,8 @@ router = APIRouter(tags=["cleanup"])
 def _entry_signatures(entry: dict) -> list:
     """Une entrée série/saison a une empreinte par épisode (source_hashes) — repli
     sur l'unique source_hash pour les entrées créées avant son introduction."""
+    if entry.get("source_sigs"):
+        return [{"inode": None, "size": s.get("size"), "hash": s.get("hash")} for s in entry["source_sigs"]]
     hashes = entry.get("source_hashes") or ([entry["source_hash"]] if entry.get("source_hash") else [])
     return [{"inode": None, "size": None, "hash": h} for h in hashes]
 

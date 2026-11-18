@@ -344,7 +344,8 @@ function _showScanResults(label, scan) {
   } else {
     transTorrents.forEach(t => {
       const label  = t.tracker_name ? `Transmission — ${t.tracker_name}` : `Transmission — ${t.name}`;
-      const detail = t.tracker_name ? `${t.name} · ${LANG.trans_detail || 'Arrêt du seeding + suppression du torrent'}` : (LANG.trans_detail || 'Arrêt du seeding + suppression du torrent');
+      const how = t.match_method === 'source' ? 'seed ce fichier' : t.match_method === 'inode' ? 'seed un hardlink' : t.match_method === 'hash' ? 'seed une copie identique' : '';
+      const detail = (t.tracker_name ? `${t.name} · ` : '') + (LANG.trans_detail || 'Arrêt du seeding + suppression du torrent') + (how ? ` · ${how}` : '');
       _addConfirmRow(list, label, detail, 'var(--info)', '⬇', t.tracker_url || null);
     });
   }
@@ -353,8 +354,9 @@ function _showScanResults(label, scan) {
 
   // Copies vérifiées (hash/inode) — supprimées automatiquement, pas de case à cocher.
   (scan.copies || []).filter(c => c.match_method !== 'name').forEach(c => {
-    const badge = c.match_method === 'inode' ? '🔗 inode' : '🔍 hash';
-    const color = c.match_method === 'inode' ? 'var(--success)' : 'var(--info)';
+    const badge = c.match_method === 'inode' ? '🔗 hardlink (0 octet libéré)'
+                : c.match_method === 'symlink' ? '↪ lien cross-seed (0 octet libéré)' : '🔍 copie identique';
+    const color = c.match_method === 'hash' ? 'var(--info)' : 'var(--success)';
     const fLabel = c.file_count > 1 ? (LANG.file_plural || 'fichiers') : (LANG.file_singular || 'fichier');
     _addConfirmRow(list, c.path, `${c.size_human} · ${c.file_count} ${fLabel} · ${badge}`, color, '🗑️');
   });
@@ -510,7 +512,7 @@ function showCleanupReport(label, c) {
   const list = document.getElementById('cm-list');
   list.innerHTML = '';
   (c.details || []).forEach(d => {
-    const badge = d.is_hardlink ? '🔗' : d.match_method === 'hash' ? '🔍' : '📝';
+    const badge = d.match_method === 'symlink' ? '↪' : d.is_hardlink ? '🔗' : d.match_method === 'hash' ? '🔍' : '📝';
     const fLabel = d.files > 1 ? (LANG.file_plural || 'fichiers') : (LANG.file_singular || 'fichier');
     const li = document.createElement('li');
     li.style.cssText = 'font-size:11px;padding:6px 0;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:flex-start;word-break:break-all';

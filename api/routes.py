@@ -579,7 +579,8 @@ def api_scan_copies(
 ):
     """Scan non-destructif : trouve toutes les copies dans les chemins additionnels."""
     import os
-    from core.fileops import scan_copies_smart, _file_hash
+    from core.fileops import scan_copies_smart
+    from core.locator import scan_roots
     scan_paths = get_scan_paths(item_type)
     if not scan_paths:
         return JSONResponse({"copies": [], "total_copies": 0, "total_size_human": "0 Ko",
@@ -599,7 +600,19 @@ def api_scan_copies(
         jf_error = str(e)
 
     label  = series_title or item_title
-    result = scan_copies_smart(label, file_path, scan_paths, allow_name_fallback=True)
+    all_torrents: list = []
+    trans_error = ""
+    try:
+        all_torrents = get_transmission().get_all_torrents()
+    except Exception as e:
+        trans_error = str(e)
+    # Candidats « par nom » : utiles pour un film ou une série entière, mais pour
+    # un épisode le nom de la série attrape toutes les autres saisons/épisodes.
+    result = scan_copies_smart(label, file_path, scan_paths,
+                               allow_name_fallback=(item_type != "Episode"),
+                               torrents=all_torrents)
+    matched_torrents = result.pop("torrents", [])
+    result.pop("signatures", None)
 
     # ── Liens vers les services ────────────────────────────────────────────────
     cfg_s = get_config()
@@ -654,8 +667,9 @@ def api_scan_copies(
     try:
         from services.transmission import get_tracker_info as _get_tracker_info
 
-        tr = get_transmission()
-        torrents = tr.find_all_by_path_or_name(file_path, series_title or item_title)
+        if trans_error:
+            raise RuntimeError(trans_error)
+        torrents = matched_torrents
         if torrents:
             torrents_info = []
             for t in torrents:
@@ -674,6 +688,8 @@ def api_scan_copies(
                     "name":         t.get("name", ""),
                     "tracker_name": tname,
                     "tracker_url":  turl,
+                    "match_method": t.get("match_method", ""),
+                    "path":         t.get("host_root", ""),
                 })
             service_links["transmission_torrents"] = torrents_info
     except Exception as e:
@@ -690,7 +706,7 @@ def api_scan_copies(
         "file_exists":   os.path.exists(file_path) if file_path else False,
         "hash_computed": bool(result.get("source_hash")),
         "hash_prefix":   result.get("source_hash", "")[:12] or "(aucun)",
-        "scan_paths":    scan_paths,
+        "scan_paths":    scan_roots()[0],
         "jf_error":      jf_error or None,
         "service_links":        {k: (v if isinstance(v, str) else f"[{len(v)} torrents, {sum(1 for t in v if t.get('tracker_url'))} avec lien tracker]") for k, v in service_links.items()},
         "link_errors":          service_link_errors or None,

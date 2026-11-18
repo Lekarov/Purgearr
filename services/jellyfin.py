@@ -6,7 +6,9 @@ class JellyfinClient:
     def __init__(self, base_url: str, api_key: str):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
-        self.session.params = {"api_key": api_key}  # type: ignore[assignment]
+        # Jellyfin 10.11+/12 refuse ?api_key= et X-Emby-Token (401) :
+        # seul l'en-tête Authorization MediaBrowser est accepté.
+        self.session.headers["Authorization"] = f'MediaBrowser Token="{api_key}"'
 
     def _url(self, endpoint: str) -> str:
         return f"{self.base_url}{endpoint}"

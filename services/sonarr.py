@@ -32,6 +32,16 @@ class SonarrClient(BaseAPIClient):
                 return series
         return None
 
+    def find_by_path(self, host_path: str) -> Optional[Dict]:
+        """Série dont le dossier contient (ou est) le chemin hôte."""
+        from core.locator import to_container
+        wanted = {p.rstrip("/") for p in to_container(host_path, ["/media/série", "/downloads"])}
+        for series in self.get_all_series():
+            sp = (series.get("path") or "").rstrip("/")
+            if sp and any(w == sp or w.startswith(sp + "/") for w in wanted):
+                return series
+        return None
+
     def unmonitor_series(self, series_id: int) -> Dict:
         series = self.get_series(series_id)
         series["monitored"] = False

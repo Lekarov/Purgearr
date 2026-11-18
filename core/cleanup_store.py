@@ -57,6 +57,7 @@ def add_entry(
     torrent_name: str = None,
     scan_paths: list = None,
     source_hashes: list = None,
+    source_sigs: list = None,
 ):
     """source_hashes : empreinte de CHAQUE fichier vidéo (un dossier saison/série en a
     plusieurs) — nécessaire pour que le rescan des traces retrouve toutes les copies,
@@ -73,6 +74,9 @@ def add_entry(
             "jellyfin_item_id":   jellyfin_item_id,
             "source_hash":        source_hash,
             "source_hashes":      source_hashes or [source_hash],
+            # (taille, empreinte) par vidéo : le rescan ne lit alors que les
+            # fichiers de même taille au lieu d'empreinter toute la bibliothèque
+            "source_sigs":        source_sigs or [],
             "file_path":          file_path,
             "file_size_bytes":    file_size_bytes,
             "torrent_name":       torrent_name,

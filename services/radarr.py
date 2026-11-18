@@ -32,6 +32,20 @@ class RadarrClient(BaseAPIClient):
                 return movie
         return None
 
+    def find_by_path(self, host_path: str) -> Optional[Dict]:
+        """Film dont le fichier (ou le dossier) correspond exactement au chemin
+        hôte — Radarr voit /media/film, Purgearr voit le chemin réel du NAS."""
+        from core.locator import to_container
+        wanted = {p.rstrip("/") for p in to_container(host_path, ["/media/film", "/downloads"])}
+        for movie in self.get_all_movies():
+            mf = (movie.get("movieFile") or {}).get("path", "")
+            if mf and mf.rstrip("/") in wanted:
+                return movie
+            mp = (movie.get("path") or "").rstrip("/")
+            if mp and mp in wanted:
+                return movie
+        return None
+
     def unmonitor(self, movie_id: int) -> Dict:
         movie = self.get_movie(movie_id)
         movie["monitored"] = False
