@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from api.route_bot import router as bot_router
 from api.routes import router as dashboard_router
 from api.webhook import router as webhook_router
 from core.pipeline import dedupe_deletion_history
@@ -37,6 +38,7 @@ app = FastAPI(title="Purgearr", version="0.5.0-beta", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.include_router(webhook_router)
 app.include_router(dashboard_router)
+app.include_router(bot_router)
 
 
 if __name__ == "__main__":
