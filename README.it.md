@@ -178,6 +178,15 @@ Il webhook riceve eventi `PlaybackStop` da Jellyfin in tempo reale. Installa il 
 
 ---
 
+## Controllo da Telegram (DoktorTV Bot)
+
+Purgearr si può controllare da Telegram con **[DoktorTV Bot](https://github.com/Lekarov/DoktorTV-Bot)**: suggerimenti di eliminazione uno alla volta (film visti, serie viste o iniziate, mai visti, i più pesanti), scheda con locandina, **anteprima esatta** di ciò che verrà eliminato (libreria, torrent per tracker, hardlink, link cross-seed, copie) e conferma.
+
+- Il bot usa le rotte `/api/bot/*` (Purgearr **1.2.0+**). Nel `.env` del bot: `PURGEARR_URL=http://[IP]:7979`
+- Test: `curl http://[IP]:7979/api/bot/ping`
+
+---
+
 ## Aggiornamento
 
 ```bash

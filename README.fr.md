@@ -179,6 +179,17 @@ Le webhook reçoit les événements `PlaybackStop` de Jellyfin en temps réel. I
 
 ---
 
+## Pilotage depuis Telegram (DoktorTV Bot)
+
+Purgearr se pilote depuis Telegram avec **[DoktorTV Bot](https://github.com/Lekarov/DoktorTV-Bot)** : suggestions de suppression une par une (films vus, séries vues ou entamées, jamais regardés, les plus lourds), fiche détaillée avec affiche, **aperçu exact** de ce qui sera supprimé (bibliothèque, torrents par tracker, hardlinks, liens cross-seed, copies), confirmation, et bouton « garder » qui protège le titre.
+
+- Le bot parle à Purgearr en HTTP via les routes `/api/bot/*` (Purgearr **1.2.0 ou plus**).
+- Dans le `.env` du bot : `PURGEARR_URL=http://[IP]:7979`
+- Vérification : `curl http://[IP]:7979/api/bot/ping` → `{"app":"purgearr","version":"1.2.0","bot_api":1}`
+- Le bot ne supprime jamais rien lui-même : chaque suppression passe par le pipeline de Purgearr, après aperçu et confirmation.
+
+---
+
 ## Mise à jour
 
 ```bash

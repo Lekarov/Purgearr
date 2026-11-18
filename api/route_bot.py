@@ -1,4 +1,4 @@
-"""API JSON pour le bot Telegram DoktorTV (@DoktorTV_Bot).
+"""API JSON pour le bot Telegram DoktorTV — https://github.com/Lekarov/DoktorTV-Bot
 
 Le bot ne supprime rien lui-même : il lit ces routes puis passe par les mêmes
 routes que l'interface web (/api/scan/copies puis /api/delete/manual), donc par
@@ -142,6 +142,13 @@ def forget(item_id: str):
 
 def _public(i: Dict) -> Dict:
     return {**i, "size_human": format_size(i["size_bytes"])}
+
+
+@router.get("/ping")
+def ping():
+    """Permet au bot de vérifier qu'il parle à un Purgearr compatible."""
+    from version import BOT_API, VERSION
+    return {"app": "purgearr", "version": VERSION, "bot_api": BOT_API}
 
 
 @router.get("/candidates")

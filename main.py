@@ -10,6 +10,7 @@ from api.webhook import router as webhook_router
 from core.pipeline import dedupe_deletion_history
 from database import SessionLocal, init_db, migrate_db
 from scheduler import start_scheduler, stop_scheduler
+from version import VERSION
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +35,7 @@ async def lifespan(app: FastAPI):
     stop_scheduler()
 
 
-app = FastAPI(title="Purgearr", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Purgearr", version=VERSION, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.include_router(webhook_router)
 app.include_router(dashboard_router)
